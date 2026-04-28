@@ -249,6 +249,12 @@ async def demo_init():
         return {
             "success": True,
             "message": "演示数据初始化成功",
+            "alice": {
+                "user_id": demo_users[0]["user_id"],
+                "account_id": demo_users[0]["account_id"],
+                "username": "演示用户1",
+                "balance": demo_users[0]["balance"]
+            },
             "demo_users": demo_users,
             "demo_agents": demo_agents
         }
