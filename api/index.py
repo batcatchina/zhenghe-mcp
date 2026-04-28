@@ -108,6 +108,12 @@ async def get_stats():
             )
             cumulative_burned = float(result.scalar() or 0)
             
+            # 累计铸造
+            result = await conn.execute(
+                text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE tx_type = 'MINT'")
+            )
+            cumulative_minted = float(result.scalar() or 0)
+            
             return {
                 "total_accounts": total_accounts,
                 "total_transactions": total_txs,
@@ -116,7 +122,8 @@ async def get_stats():
                 "pool_usdt": pool_usdt,
                 "pool_tokens": pool_tokens,
                 "current_price": current_price,
-                "cumulative_burned": cumulative_burned
+                "cumulative_burned": cumulative_burned,
+                "cumulative_minted": cumulative_minted
             }
     except Exception as e:
         return {
@@ -128,6 +135,7 @@ async def get_stats():
             "pool_tokens": 0,
             "current_price": 1.0,
             "cumulative_burned": 0,
+            "cumulative_minted": 0,
             "error": str(e)
         }
 
@@ -265,16 +273,23 @@ async def get_account(account_id: str):
     try:
         async with db.connect() as conn:
             result = await conn.execute(
-                text("SELECT id, balance, user_id FROM accounts WHERE id = :id"),
+                text("""
+                    SELECT a.id, a.balance, a.user_id, u.username
+                    FROM accounts a
+                    LEFT JOIN users u ON a.user_id = u.id
+                    WHERE a.id = :id
+                """),
                 {"id": account_id}
             )
             row = result.fetchone()
             
             if row:
                 return {
+                    "account_id": row[0],
                     "id": row[0],
                     "balance": str(row[1]),
-                    "user_id": row[2]
+                    "user_id": row[2],
+                    "username": row[3] or "未命名用户"
                 }
     except:
         pass
