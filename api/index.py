@@ -526,6 +526,49 @@ async def consume_service(request: Request):
         return {"success": False, "error": str(e)}
 
 
+async def register_agent_internal(arguments: dict):
+    """Agent注册内部函数"""
+    agent_name = arguments.get("name", f"Agent_{uuid.uuid4().hex[:8]}")
+    
+    db = await get_db_engine()
+    if not db:
+        return {"success": False, "error": "数据库未配置"}
+    
+    try:
+        agent_id = f"agent_{uuid.uuid4().hex[:24]}"
+        account_id = f"acc_{uuid.uuid4().hex[:24]}"
+        api_key = f"sk_live_{secrets.token_hex(24)}"
+        
+        async with db.begin() as conn:
+            # 创建Agent关联账户
+            await conn.execute(
+                text("INSERT INTO accounts (id, balance, account_type) VALUES (:id, 0, 'agent')"),
+                {"id": account_id}
+            )
+            
+            # 注册Agent
+            await conn.execute(
+                text("INSERT INTO agents (id, name, status, account_id) VALUES (:id, :name, 'active', :account_id)"),
+                {"id": agent_id, "name": agent_name, "account_id": account_id}
+            )
+            
+            # 创建API Key
+            await conn.execute(
+                text("INSERT INTO api_keys (id, key_hash, agent_id, permissions) VALUES (:id, :key, :agent, '{\"role\": \"agent\"}'::jsonb)"),
+                {"id": f"key_{uuid.uuid4().hex[:24]}", "key": api_key, "agent": agent_id}
+            )
+        
+        return {
+            "success": True,
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+            "account_id": account_id,
+            "api_key": api_key
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 @app.post("/mcp")
 async def mcp_endpoint(request: Request):
     """MCP JSON-RPC 2.0 端点"""
@@ -537,12 +580,15 @@ async def mcp_endpoint(request: Request):
         
         if method == "tools/list":
             tools = [
-                {"name": "get_balance", "description": "查询账户积分余额"},
-                {"name": "get_price", "description": "查询当前积分价格"},
-                {"name": "register_agent", "description": "注册新Agent"},
-                {"name": "consume", "description": "消费Agent服务"},
-                {"name": "mint", "description": "铸造积分"},
-                {"name": "burn", "description": "燃烧积分"},
+                {"name": "get_balance", "description": "查询账户积分余额", "inputSchema": {"type": "object", "properties": {"account_id": {"type": "string", "description": "账户ID"}}}},
+                {"name": "get_price", "description": "查询当前积分价格和资金池状态"},
+                {"name": "get_stats", "description": "查询系统统计数据"},
+                {"name": "get_agents", "description": "获取Agent列表"},
+                {"name": "create_account", "description": "创建新账户", "inputSchema": {"type": "object", "properties": {"username": {"type": "string", "description": "用户名"}}}},
+                {"name": "register_agent", "description": "注册新Agent", "inputSchema": {"type": "object", "properties": {"name": {"type": "string", "description": "Agent名称"}}}},
+                {"name": "mint", "description": "铸造积分（充值）", "inputSchema": {"type": "object", "properties": {"account_id": {"type": "string"}, "amount": {"type": "number", "description": "USDT金额"}}}},
+                {"name": "burn", "description": "燃烧积分（提现）", "inputSchema": {"type": "object", "properties": {"account_id": {"type": "string"}, "amount": {"type": "number", "description": "积分数量"}}}},
+                {"name": "consume", "description": "消费Agent服务", "inputSchema": {"type": "object", "properties": {"consumer_account_id": {"type": "string"}, "agent_id": {"type": "string"}, "pricing_usdt": {"type": "number"}}}},
             ]
             return {
                 "jsonrpc": "2.0",
@@ -558,6 +604,33 @@ async def mcp_endpoint(request: Request):
                 result = await get_pool_state()
             elif tool_name == "get_balance":
                 result = await get_account(arguments.get("account_id", ""))
+            elif tool_name == "get_stats":
+                result = await get_stats()
+            elif tool_name == "get_agents":
+                result = await get_agents()
+            elif tool_name == "mint":
+                # 构造模拟Request对象
+                class MockRequest:
+                    async def json(self):
+                        return arguments
+                result = await mint_tokens(MockRequest())
+            elif tool_name == "burn":
+                class MockRequest:
+                    async def json(self):
+                        return arguments
+                result = await burn_tokens(MockRequest())
+            elif tool_name == "consume":
+                class MockRequest:
+                    async def json(self):
+                        return arguments
+                result = await consume_service(MockRequest())
+            elif tool_name == "register_agent":
+                result = await register_agent_internal(arguments)
+            elif tool_name == "create_account":
+                class MockRequest:
+                    async def json(self):
+                        return arguments
+                result = await create_user(MockRequest())
             else:
                 result = {"error": f"工具不存在: {tool_name}"}
             
