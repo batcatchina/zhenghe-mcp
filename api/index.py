@@ -68,7 +68,16 @@ async def get_stats():
     """获取系统统计"""
     db = await get_db_engine()
     if not db:
-        return {"total_accounts": 0, "total_transactions": 0, "total_agents": 0}
+        return {
+            "total_accounts": 0,
+            "total_transactions": 0,
+            "total_agents": 0,
+            "total_users": 0,
+            "pool_usdt": 0,
+            "pool_tokens": 0,
+            "current_price": 1.0,
+            "cumulative_burned": 0
+        }
     
     try:
         async with db.connect() as conn:
@@ -81,13 +90,46 @@ async def get_stats():
             result = await conn.execute(text("SELECT COUNT(*) FROM agents"))
             total_agents = result.scalar() or 0
             
+            result = await conn.execute(text("SELECT COUNT(*) FROM users"))
+            total_users = result.scalar() or 0
+            
+            # 获取资金池数据
+            result = await conn.execute(
+                text("SELECT price, total_supply, capital_pool FROM prices ORDER BY recorded_at DESC LIMIT 1")
+            )
+            pool_row = result.fetchone()
+            pool_usdt = float(pool_row[2]) if pool_row else 0
+            pool_tokens = float(pool_row[1]) if pool_row else 0
+            current_price = float(pool_row[0]) if pool_row else 1.0
+            
+            # 累计销毁
+            result = await conn.execute(
+                text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE tx_type = 'BURN'")
+            )
+            cumulative_burned = float(result.scalar() or 0)
+            
             return {
                 "total_accounts": total_accounts,
                 "total_transactions": total_txs,
-                "total_agents": total_agents
+                "total_agents": total_agents,
+                "total_users": total_users,
+                "pool_usdt": pool_usdt,
+                "pool_tokens": pool_tokens,
+                "current_price": current_price,
+                "cumulative_burned": cumulative_burned
             }
     except Exception as e:
-        return {"total_accounts": 0, "total_transactions": 0, "total_agents": 0, "error": str(e)}
+        return {
+            "total_accounts": 0,
+            "total_transactions": 0,
+            "total_agents": 0,
+            "total_users": 0,
+            "pool_usdt": 0,
+            "pool_tokens": 0,
+            "current_price": 1.0,
+            "cumulative_burned": 0,
+            "error": str(e)
+        }
 
 
 @app.get("/v1/pool/state")
@@ -177,6 +219,40 @@ async def get_transactions(limit: int = 50):
             }
     except:
         return {"transactions": []}
+
+
+@app.get("/v1/accounts")
+async def get_accounts():
+    """获取账户列表"""
+    db = await get_db_engine()
+    if not db:
+        return {"accounts": []}
+    
+    try:
+        async with db.connect() as conn:
+            result = await conn.execute(
+                text("""
+                    SELECT a.id, a.balance, a.user_id, u.username 
+                    FROM accounts a 
+                    LEFT JOIN users u ON a.user_id = u.id
+                    ORDER BY a.created_at DESC LIMIT 20
+                """)
+            )
+            rows = result.fetchall()
+            
+            return {
+                "accounts": [
+                    {
+                        "account_id": row[0],
+                        "balance": str(row[1]),
+                        "user_id": row[2],
+                        "username": row[3] or "未命名用户"
+                    }
+                    for row in rows
+                ]
+            }
+    except:
+        return {"accounts": []}
 
 
 @app.get("/v1/accounts/{account_id}")
