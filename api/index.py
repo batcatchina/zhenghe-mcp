@@ -177,21 +177,15 @@ async def get_agents():
         async with db.connect() as conn:
             result = await conn.execute(
                 text("""
-                    SELECT a.id, a.name, a.status, a.created_at, a.account_id
+                    SELECT a.id, a.name, a.status, a.created_at, a.account_id, 
+                           COALESCE(a.pricing_usdt, 1.0) as pricing_usdt,
+                           COALESCE(a.category, 'AI服务') as category,
+                           COALESCE(a.description, '提供优质AI服务') as description
                     FROM agents a 
                     ORDER BY a.created_at DESC LIMIT 20
                 """)
             )
             rows = result.fetchall()
-            
-            categories = ["AI写作", "数据分析", "代码助手", "法律咨询", "营销策划"]
-            descriptions = [
-                "提供专业的AI写作服务，包括文章、文案、报告等",
-                "数据分析和可视化服务，帮助您洞察业务",
-                "代码编写、调试、优化服务",
-                "法律咨询和合同审查服务",
-                "品牌营销策略和推广方案"
-            ]
             
             return {
                 "agents": [
@@ -202,11 +196,11 @@ async def get_agents():
                         "status": row[2],
                         "created_at": str(row[3]) if row[3] else "",
                         "account_id": row[4] if row[4] else f"acc_{row[0]}",
-                        "pricing_usdt": "1.0",
-                        "category": categories[i % len(categories)],
-                        "description": descriptions[i % len(descriptions)]
+                        "pricing_usdt": str(row[5]) if row[5] else "1.0",
+                        "category": row[6] if row[6] else "AI服务",
+                        "description": row[7] if row[7] else "提供优质AI服务"
                     }
-                    for i, row in enumerate(rows)
+                    for row in rows
                 ]
             }
     except:
@@ -240,8 +234,8 @@ async def register_agent_api(request: Request):
             
             # 注册Agent
             await conn.execute(
-                text("INSERT INTO agents (id, name, status, owner_user_id, account_id) VALUES (:id, :name, 'active', 'system', :account_id)"),
-                {"id": agent_id, "name": agent_name, "account_id": account_id}
+                text("INSERT INTO agents (id, name, status, owner_user_id, account_id, pricing_usdt, category, description) VALUES (:id, :name, 'active', 'system', :account_id, :pricing, :category, :description)"),
+                {"id": agent_id, "name": agent_name, "account_id": account_id, "pricing": pricing_usdt, "category": category, "description": description}
             )
             
             # 创建API Key
@@ -377,6 +371,15 @@ async def demo_init():
                 await conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"))
             except:
                 pass
+            
+            # 数据库迁移：添加pricing_usdt, category, description列到agents表
+            try:
+                await conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS pricing_usdt DECIMAL(20,8) DEFAULT 1.0"))
+                await conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS category VARCHAR(100) DEFAULT 'AI服务'"))
+                await conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '提供优质AI服务'"))
+            except:
+                pass
+            
             demo_users = []
             for i in range(2):
                 user_id = f"user_demo_{i+1}"
