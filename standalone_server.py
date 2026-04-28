@@ -290,7 +290,15 @@ async def create_user(request: Request):
         return {
             "user_id": user_id,
             "account_id": account_id,
-            "username": username
+            "username": username,
+            "user": {
+                "user_id": user_id,
+                "username": username
+            },
+            "account": {
+                "account_id": account_id,
+                "balance": "0"
+            }
         }
     except Exception as e:
         return {"error": str(e)}
