@@ -177,10 +177,8 @@ async def get_agents():
         async with db.connect() as conn:
             result = await conn.execute(
                 text("""
-                    SELECT a.id, a.name, a.status, a.created_at, 
-                           COALESCE(k.account_id, '') as account_id
+                    SELECT a.id, a.name, a.status, a.created_at, a.account_id
                     FROM agents a 
-                    LEFT JOIN api_keys k ON a.id = k.agent_id
                     ORDER BY a.created_at DESC LIMIT 20
                 """)
             )
@@ -242,8 +240,8 @@ async def register_agent_api(request: Request):
             
             # 注册Agent
             await conn.execute(
-                text("INSERT INTO agents (id, name, status, owner_user_id) VALUES (:id, :name, 'active', 'system')"),
-                {"id": agent_id, "name": agent_name}
+                text("INSERT INTO agents (id, name, status, owner_user_id, account_id) VALUES (:id, :name, 'active', 'system', :account_id)"),
+                {"id": agent_id, "name": agent_name, "account_id": account_id}
             )
             
             # 创建API Key
