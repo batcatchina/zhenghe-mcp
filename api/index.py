@@ -496,10 +496,10 @@ async def mint_tokens(request: Request):
             total_supply = Decimal(str(price_row[1])) if price_row else Decimal("0")
             capital_pool = Decimal(str(price_row[2])) if price_row else Decimal("0")
             
-            # 99.1%入资金池
+            # 99.1%入资金池（0.9%手续费归池）
             pool_in = usdt_amount * Decimal("0.991")
-            # 铸造的积分数量 = USDT / 当前价格
-            minted_tokens = usdt_amount / current_price
+            # 铸造的积分数量 = 入池USDT / 当前价格
+            minted_tokens = pool_in / current_price
             
             # 更新账户余额
             result = await conn.execute(
@@ -572,8 +572,8 @@ async def burn_tokens(request: Request):
             if not acc_row or Decimal(str(acc_row[0])) < token_amount:
                 return {"success": False, "error": "余额不足"}
             
-            # 计算可提现USDT = 积分 * 当前价格 * (1 - 0.9%手续费)
-            usdt_out = token_amount * current_price * Decimal("0.991")
+            # 计算可提现USDT = 积分 × 当前价格（0%手续费）
+            usdt_out = token_amount * current_price
             
             # 更新账户余额
             result = await conn.execute(
@@ -611,7 +611,7 @@ async def burn_tokens(request: Request):
 
 @app.post("/v1/consume")
 async def consume_service(request: Request):
-    """消费服务"""
+    """消费服务 - 正和经济模型完整实现"""
     body = await request.json()
     consumer_account_id = body.get("consumer_account_id")
     provider_agent_id = body.get("agent_id") or body.get("provider_agent_id")
@@ -623,15 +623,24 @@ async def consume_service(request: Request):
     
     try:
         async with db.begin() as conn:
+            # 获取当前价格和资金池
             result = await conn.execute(
-                text("SELECT price FROM prices ORDER BY recorded_at DESC LIMIT 1")
+                text("SELECT price, total_supply, capital_pool FROM prices ORDER BY recorded_at DESC LIMIT 1 FOR UPDATE")
             )
             price_row = result.fetchone()
             price = Decimal(str(price_row[0])) if price_row else Decimal("1.0")
+            total_supply = Decimal(str(price_row[1])) if price_row else Decimal("0")
+            capital_pool = Decimal(str(price_row[2])) if price_row else Decimal("0")
             
+            # 消费者销毁积分 = 定价USDT / 价格 × 1.009
             burn_multiplier = Decimal("1.009")
             burned_tokens = (pricing_usdt / price) * burn_multiplier
             
+            # 消费者奖励 = 定价 × 0.5%
+            consumer_reward_usdt = pricing_usdt * Decimal("0.005")
+            consumer_reward_tokens = consumer_reward_usdt / price
+            
+            # 检查消费者余额
             result = await conn.execute(
                 text("SELECT balance FROM accounts WHERE id = :id FOR UPDATE"),
                 {"id": consumer_account_id}
@@ -641,12 +650,44 @@ async def consume_service(request: Request):
             if not row or Decimal(str(row[0])) < burned_tokens:
                 return {"success": False, "error": "余额不足"}
             
-            new_balance = Decimal(str(row[0])) - burned_tokens
+            # 更新消费者余额（销毁积分 + 获得奖励）
+            consumer_new_balance = Decimal(str(row[0])) - burned_tokens + consumer_reward_tokens
             await conn.execute(
                 text("UPDATE accounts SET balance = :balance WHERE id = :id"),
-                {"balance": new_balance, "id": consumer_account_id}
+                {"balance": consumer_new_balance, "id": consumer_account_id}
             )
             
+            # 查找服务者账户（Agent关联的账户）
+            result = await conn.execute(
+                text("SELECT account_id FROM agents WHERE id = :agent_id"),
+                {"agent_id": provider_agent_id}
+            )
+            agent_row = result.fetchone()
+            
+            if agent_row and agent_row[0]:
+                provider_account_id = agent_row[0]
+                # 服务者获得全额USDT对应的积分
+                provider_tokens = pricing_usdt / price
+                await conn.execute(
+                    text("UPDATE accounts SET balance = balance + :tokens WHERE id = :id"),
+                    {"tokens": provider_tokens, "id": provider_account_id}
+                )
+            
+            # 更新资金池（扣除给服务者和奖励）
+            pool_out = pricing_usdt + consumer_reward_usdt
+            new_capital = capital_pool - pool_out
+            new_supply = total_supply - burned_tokens + consumer_reward_tokens
+            if agent_row and agent_row[0]:
+                new_supply += provider_tokens
+            
+            new_price = new_capital / new_supply if new_supply > 0 else price
+            
+            await conn.execute(
+                text("INSERT INTO prices (price, total_supply, capital_pool, recorded_at) VALUES (:price, :supply, :capital, :now)"),
+                {"price": new_price, "supply": new_supply, "capital": new_capital, "now": datetime.utcnow()}
+            )
+            
+            # 记录交易
             tx_id = f"tx_{uuid.uuid4().hex[:24]}"
             service_id = f"svc_{uuid.uuid4().hex[:24]}"
             await conn.execute(
@@ -659,7 +700,10 @@ async def consume_service(request: Request):
                 "tx_id": tx_id,
                 "service_id": service_id,
                 "burned_tokens": str(burned_tokens),
-                "new_balance": str(new_balance)
+                "consumer_reward": str(consumer_reward_tokens),
+                "provider_payment": str(pricing_usdt / price) if agent_row and agent_row[0] else "0",
+                "new_balance": str(consumer_new_balance),
+                "new_price": str(new_price)
             }
     except Exception as e:
         return {"success": False, "error": str(e)}
