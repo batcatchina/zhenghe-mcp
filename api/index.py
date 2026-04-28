@@ -186,6 +186,15 @@ async def get_agents():
             )
             rows = result.fetchall()
             
+            categories = ["AI写作", "数据分析", "代码助手", "法律咨询", "营销策划"]
+            descriptions = [
+                "提供专业的AI写作服务，包括文章、文案、报告等",
+                "数据分析和可视化服务，帮助您洞察业务",
+                "代码编写、调试、优化服务",
+                "法律咨询和合同审查服务",
+                "品牌营销策略和推广方案"
+            ]
+            
             return {
                 "agents": [
                     {
@@ -195,13 +204,66 @@ async def get_agents():
                         "status": row[2],
                         "created_at": str(row[3]) if row[3] else "",
                         "account_id": row[4] if row[4] else f"acc_{row[0]}",
-                        "pricing_usdt": "1.0"
+                        "pricing_usdt": "1.0",
+                        "category": categories[i % len(categories)],
+                        "description": descriptions[i % len(descriptions)]
                     }
-                    for row in rows
+                    for i, row in enumerate(rows)
                 ]
             }
     except:
         return {"agents": []}
+
+
+@app.post("/v1/agents/register")
+async def register_agent_api(request: Request):
+    """注册新Agent（REST API）"""
+    body = await request.json()
+    agent_name = body.get("name", f"Agent_{uuid.uuid4().hex[:8]}")
+    category = body.get("category", "AI服务")
+    description = body.get("description", "提供优质AI服务")
+    pricing_usdt = body.get("pricing_usdt", "1.0")
+    
+    db = await get_db_engine()
+    if not db:
+        return {"success": False, "error": "数据库未配置"}
+    
+    try:
+        agent_id = f"agent_{uuid.uuid4().hex[:24]}"
+        account_id = f"acc_{uuid.uuid4().hex[:24]}"
+        api_key = f"sk_live_{secrets.token_hex(24)}"
+        
+        async with db.begin() as conn:
+            # 创建Agent关联账户
+            await conn.execute(
+                text("INSERT INTO accounts (id, balance, account_type) VALUES (:id, 0, 'agent')"),
+                {"id": account_id}
+            )
+            
+            # 注册Agent
+            await conn.execute(
+                text("INSERT INTO agents (id, name, status, owner_user_id) VALUES (:id, :name, 'active', 'system')"),
+                {"id": agent_id, "name": agent_name}
+            )
+            
+            # 创建API Key
+            await conn.execute(
+                text("INSERT INTO api_keys (id, key_hash, agent_id, permissions) VALUES (:id, :key, :agent, '{\"role\": \"agent\"}'::jsonb)"),
+                {"id": f"key_{uuid.uuid4().hex[:24]}", "key": api_key, "agent": agent_id}
+            )
+        
+        return {
+            "success": True,
+            "agent_id": agent_id,
+            "name": agent_name,
+            "account_id": account_id,
+            "api_key": api_key,
+            "category": category,
+            "description": description,
+            "pricing_usdt": pricing_usdt
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 @app.get("/v1/transactions")
