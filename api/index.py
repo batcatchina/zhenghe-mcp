@@ -402,10 +402,10 @@ async def create_user(request: Request):
 
 @app.post("/v1/mint")
 async def mint_tokens(request: Request):
-    """铸造积分"""
+    """铸造积分（充值USDT→积分）"""
     body = await request.json()
     account_id = body.get("account_id")
-    amount = Decimal(str(body.get("usdt_amount") or body.get("amount", 0)))
+    usdt_amount = Decimal(str(body.get("usdt_amount") or body.get("amount", 0)))
     
     db = await get_db_engine()
     if not db:
@@ -413,31 +413,65 @@ async def mint_tokens(request: Request):
     
     try:
         async with db.begin() as conn:
+            # 获取当前价格
             result = await conn.execute(
-                text("UPDATE accounts SET balance = balance + :amount WHERE id = :id RETURNING balance"),
-                {"amount": amount, "id": account_id}
+                text("SELECT price, total_supply, capital_pool FROM prices ORDER BY recorded_at DESC LIMIT 1 FOR UPDATE")
+            )
+            price_row = result.fetchone()
+            current_price = Decimal(str(price_row[0])) if price_row else Decimal("1.0")
+            total_supply = Decimal(str(price_row[1])) if price_row else Decimal("0")
+            capital_pool = Decimal(str(price_row[2])) if price_row else Decimal("0")
+            
+            # 99.1%入资金池
+            pool_in = usdt_amount * Decimal("0.991")
+            # 铸造的积分数量 = USDT / 当前价格
+            minted_tokens = usdt_amount / current_price
+            
+            # 更新账户余额
+            result = await conn.execute(
+                text("UPDATE accounts SET balance = balance + :tokens WHERE id = :id RETURNING balance"),
+                {"tokens": minted_tokens, "id": account_id}
             )
             row = result.fetchone()
             
-            if row:
-                return {
-                    "success": True,
-                    "new_balance": str(row[0]),
-                    "minted": str(amount),
-                    "minted_tokens": str(amount)
-                }
+            if not row:
+                return {"success": False, "error": "账户不存在"}
+            
+            # 更新资金池
+            new_supply = total_supply + minted_tokens
+            new_capital = capital_pool + pool_in
+            new_price = new_capital / new_supply if new_supply > 0 else current_price
+            
+            await conn.execute(
+                text("INSERT INTO prices (price, total_supply, capital_pool, recorded_at) VALUES (:price, :supply, :capital, :now)"),
+                {"price": new_price, "supply": new_supply, "capital": new_capital, "now": datetime.utcnow()}
+            )
+            
+            # 记录交易
+            tx_id = f"tx_{uuid.uuid4().hex[:24]}"
+            await conn.execute(
+                text("INSERT INTO transactions (id, tx_type, amount, from_account_id) VALUES (:id, 'MINT', :amount, :from)"),
+                {"id": tx_id, "amount": minted_tokens, "from": account_id}
+            )
+            
+            return {
+                "success": True,
+                "new_balance": str(row[0]),
+                "minted_tokens": str(minted_tokens),
+                "minted": str(minted_tokens),
+                "pool_in": str(pool_in),
+                "new_price": str(new_price)
+            }
     except Exception as e:
         return {"success": False, "error": str(e)}
-    
-    return {"success": False, "error": "账户不存在"}
 
 
 @app.post("/v1/burn")
 async def burn_tokens(request: Request):
-    """燃烧积分"""
+    """燃烧积分（提现积分→USDT）"""
     body = await request.json()
     account_id = body.get("account_id")
-    amount = Decimal(str(body.get("token_amount") or body.get("amount", 0)))
+    token_amount = Decimal(str(body.get("token_amount") or body.get("amount", 0)))
     
     db = await get_db_engine()
     if not db:
@@ -445,26 +479,57 @@ async def burn_tokens(request: Request):
     
     try:
         async with db.begin() as conn:
+            # 获取当前价格和资金池
+            result = await conn.execute(
+                text("SELECT price, total_supply, capital_pool FROM prices ORDER BY recorded_at DESC LIMIT 1 FOR UPDATE")
+            )
+            price_row = result.fetchone()
+            current_price = Decimal(str(price_row[0])) if price_row else Decimal("1.0")
+            total_supply = Decimal(str(price_row[1])) if price_row else Decimal("0")
+            capital_pool = Decimal(str(price_row[2])) if price_row else Decimal("0")
+            
+            # 检查账户余额
             result = await conn.execute(
                 text("SELECT balance FROM accounts WHERE id = :id FOR UPDATE"),
                 {"id": account_id}
             )
-            row = result.fetchone()
+            acc_row = result.fetchone()
             
-            if not row or Decimal(str(row[0])) < amount:
+            if not acc_row or Decimal(str(acc_row[0])) < token_amount:
                 return {"success": False, "error": "余额不足"}
             
+            # 计算可提现USDT = 积分 * 当前价格 * (1 - 0.9%手续费)
+            usdt_out = token_amount * current_price * Decimal("0.991")
+            
+            # 更新账户余额
             result = await conn.execute(
-                text("UPDATE accounts SET balance = balance - :amount WHERE id = :id RETURNING balance"),
-                {"amount": amount, "id": account_id}
+                text("UPDATE accounts SET balance = balance - :tokens WHERE id = :id RETURNING balance"),
+                {"tokens": token_amount, "id": account_id}
             )
             new_row = result.fetchone()
+            
+            # 更新资金池
+            new_supply = total_supply - token_amount
+            new_capital = capital_pool - usdt_out
+            new_price = new_capital / new_supply if new_supply > 0 else current_price
+            
+            await conn.execute(
+                text("INSERT INTO prices (price, total_supply, capital_pool, recorded_at) VALUES (:price, :supply, :capital, :now)"),
+                {"price": new_price, "supply": new_supply, "capital": new_capital, "now": datetime.utcnow()}
+            )
+            
+            # 记录交易
+            tx_id = f"tx_{uuid.uuid4().hex[:24]}"
+            await conn.execute(
+                text("INSERT INTO transactions (id, tx_type, amount, from_account_id) VALUES (:id, 'BURN', :amount, :from)"),
+                {"id": tx_id, "amount": token_amount, "from": account_id}
+            )
             
             return {
                 "success": True,
                 "new_balance": str(new_row[0]),
-                "burned": str(amount),
-                "usdt_out": str(amount)
+                "burned": str(token_amount),
+                "usdt_out": str(usdt_out)
             }
     except Exception as e:
         return {"success": False, "error": str(e)}
