@@ -126,13 +126,27 @@ async def get_agents():
     try:
         async with db.connect() as conn:
             result = await conn.execute(
-                text("SELECT id, name, status, created_at FROM agents ORDER BY created_at DESC LIMIT 20")
+                text("""
+                    SELECT a.id, a.name, a.status, a.created_at, 
+                           COALESCE(k.account_id, '') as account_id
+                    FROM agents a 
+                    LEFT JOIN api_keys k ON a.id = k.agent_id
+                    ORDER BY a.created_at DESC LIMIT 20
+                """)
             )
             rows = result.fetchall()
             
             return {
                 "agents": [
-                    {"id": row[0], "name": row[1], "status": row[2], "created_at": str(row[3]) if row[3] else ""}
+                    {
+                        "id": row[0],
+                        "agent_id": row[0],  # 前端期望的字段名
+                        "name": row[1],
+                        "status": row[2],
+                        "created_at": str(row[3]) if row[3] else "",
+                        "account_id": row[4] if row[4] else f"acc_{row[0]}",
+                        "pricing_usdt": "1.0"  # 默认定价
+                    }
                     for row in rows
                 ]
             }
@@ -309,7 +323,8 @@ async def mint_tokens(request: Request):
     """铸造积分（充值）"""
     body = await request.json()
     account_id = body.get("account_id")
-    amount = Decimal(str(body.get("amount", 0)))
+    # 兼容两种参数名
+    amount = Decimal(str(body.get("usdt_amount") or body.get("amount", 0)))
     
     db = await get_db_engine()
     if not db:
@@ -327,7 +342,8 @@ async def mint_tokens(request: Request):
                 return {
                     "success": True,
                     "new_balance": str(row[0]),
-                    "minted": str(amount)
+                    "minted": str(amount),
+                    "minted_tokens": str(amount)  # 前端期望的字段名
                 }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -340,7 +356,8 @@ async def burn_tokens(request: Request):
     """燃烧积分（提现）"""
     body = await request.json()
     account_id = body.get("account_id")
-    amount = Decimal(str(body.get("amount", 0)))
+    # 兼容两种参数名
+    amount = Decimal(str(body.get("token_amount") or body.get("amount", 0)))
     
     db = await get_db_engine()
     if not db:
@@ -366,7 +383,8 @@ async def burn_tokens(request: Request):
             return {
                 "success": True,
                 "new_balance": str(new_row[0]),
-                "burned": str(amount)
+                "burned": str(amount),
+                "usdt_out": str(amount)  # 前端期望的字段名
             }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -377,7 +395,9 @@ async def consume_service(request: Request):
     """消费服务"""
     body = await request.json()
     consumer_account_id = body.get("consumer_account_id")
-    provider_agent_id = body.get("provider_agent_id")
+    # 兼容两种参数名
+    provider_agent_id = body.get("agent_id") or body.get("provider_agent_id")
+    provider_account_id = body.get("provider_account_id")
     pricing_usdt = Decimal(str(body.get("pricing_usdt", 0)))
     
     db = await get_db_engine()
@@ -411,6 +431,7 @@ async def consume_service(request: Request):
             )
             
             tx_id = f"tx_{uuid.uuid4().hex[:24]}"
+            service_id = f"svc_{uuid.uuid4().hex[:24]}"  # 前端期望的字段
             await conn.execute(
                 text("INSERT INTO transactions (id, tx_type, amount, from_account_id) VALUES (:id, 'CONSUME', :amount, :from)"),
                 {"id": tx_id, "amount": burned_tokens, "from": consumer_account_id}
@@ -419,6 +440,7 @@ async def consume_service(request: Request):
             return {
                 "success": True,
                 "tx_id": tx_id,
+                "service_id": service_id,  # 前端期望的字段
                 "burned_tokens": str(burned_tokens),
                 "new_balance": str(new_balance)
             }
