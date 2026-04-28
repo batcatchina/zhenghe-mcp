@@ -366,6 +366,17 @@ async def demo_init():
     
     try:
         async with db.begin() as conn:
+            # 数据库迁移：添加account_id列到agents表
+            try:
+                await conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS account_id VARCHAR(100)"))
+            except:
+                pass  # 列已存在则忽略
+            
+            # 数据库迁移：添加created_at列到agents表
+            try:
+                await conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"))
+            except:
+                pass
             demo_users = []
             for i in range(2):
                 user_id = f"user_demo_{i+1}"
