@@ -1,842 +1,558 @@
 # -*- coding: utf-8 -*-
 """
-正和系统 - Vercel Serverless Function 入口
-所有代码内联，避免依赖问题
+正和系统 MCP Server（链上版 v2.0）
+
+架构原则：
+  - 无数据库、无 API Key、无私钥——合约即状态，链上即可信
+  - 读操作：直接 eth_call Base 主网合约
+  - 写操作：返回"签名就绪"的 calldata，由调用方（Agent/钱包）本地签名上链，
+    私钥永不离开调用方环境
+
+三大链上可核验特性：
+  ① 存款安全：LoveVault 无 owner、无管理函数，NAV 单调增长
+  ② 引路人激励：一次绑定永久分账（6bps USDC 立即到账 + 商户捐赠 LOVE 的 20%）
+  ③ 消费即升值：每笔路由支付自动注入手续费与捐赠进金库，抬升全体持有者 NAV
+
+全部代码内联于此文件，避免 Vercel Python 的依赖打包问题。
 """
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Dict, Any, Optional
 import os
-import json
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy import text
-from decimal import Decimal
-import uuid
-import secrets
-from datetime import datetime
+import time
+from typing import Any, Dict, List, Optional
 
-# 环境变量
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-SECRET_KEY = os.getenv("SECRET_KEY", "zhenghe_secret")
+import httpx
+from Crypto.Hash import keccak
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-# 数据库引擎
-engine = None
+# ==================== 链上常量（与 zhenghe-system api/a2a.mjs 单一事实来源对齐） ====================
+CHAIN_ID = 8453  # Base 主网
+RPC_URL = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")
 
-async def get_db_engine():
-    global engine
-    if engine is None and DATABASE_URL:
-        engine = create_async_engine(DATABASE_URL, echo=False, pool_size=1, max_overflow=0)
-    return engine
+ROUTER = "0x2348ec656e395edAbcE2e198DC44647456d81867"  # ZhengHeRouter：pay/payWithLove/bindReferrer
+VAULT = "0x16A7F8CfAD687A87183fCbd1dF7aF09dce05D357"  # LoveVault（ERC-4626，无 owner）
+USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # Base 原生 USDC（Circle）
+
+ASSET_DECIMALS = 6   # USDC
+LOVE_DECIMALS = 18   # LOVE share
+NAV_DECIMALS = 6     # nav() 返回 1e6 精度
+
+# 费用结构（链上常量）：消费者手续费 30bps，其中 20%（=6bps）分给引路人；商户捐赠地板 10bps
+FEE_RATE = 0.0006          # 付款方额外负担（6bps）
+DONATION_FLOOR = 0.001     # 商户捐赠 10bps
+
+SELECTOR = {
+    "nav": "0xc1590cd7",
+    "totalAssets": "0x01e1d114",
+    "totalSupply": "0x18160ddd",
+    "balanceOf": "0x70a08231",
+    "approve": "0x095ea7b3",
+    "pay": "0x7a17ac71",           # pay(uint256,bytes32,address,address)
+    "payWithLove": "0xcfcf752c",   # payWithLove(uint256,bytes32,address,address)
+    "deposit": "0x6e553f65",       # deposit(uint256,address) ERC-4626
+    "redeem": "0xba087652",        # redeem(uint256,address,address) ERC-4626
+    "bindReferrer": "0x04f618cb",  # bindReferrer(address)
+    "previewDeposit": "0xef8b30f7",
+    "maxRedeem": "0xd905777e",
+}
+
+ZERO_ADDR = "0x0000000000000000000000000000000000000000"
+
+# RPC 失败时的兜底快照（标明是快照，不冒充实时）
+FALLBACK = {"nav": 1.118038, "totalAssets": 5789.278371, "totalSupply": 5178.068752, "stale": True}
+
+# ==================== ABI 编码工具（纯 Python，无 web3 依赖） ====================
+
+def uint256_hex(n: int) -> str:
+    return format(n, "064x")
 
 
-# ===== FastAPI App =====
+def address_hex(addr: str) -> str:
+    return addr.lower().replace("0x", "").rjust(64, "0")
+
+
+def keccak256(data: bytes) -> bytes:
+    h = keccak.new(digest_bits=256)
+    h.update(data)
+    return h.digest()
+
+
+def ref_to_bytes32_hex(ref: Optional[str]) -> str:
+    """ref → bytes32：已是 0x+64hex 直接透传；否则 keccak256(utf8(ref))。
+    与 zhenghe-system 前端及 /api/orders 的链上验付口径一致。"""
+    s = str(ref or "")
+    if s.startswith("0x") and len(s) == 66:
+        try:
+            int(s[2:], 16)
+            return s[2:].lower()
+        except ValueError:
+            pass
+    return keccak256(s.encode("utf-8")).hex()
+
+
+def is_address(s: Any) -> bool:
+    if not isinstance(s, str) or not s.startswith("0x") or len(s) != 42:
+        return False
+    try:
+        int(s[2:], 16)
+        return True
+    except ValueError:
+        return False
+
+
+# ==================== Base RPC（只读 eth_call） ====================
+
+async def eth_call(to: str, data: str) -> Optional[str]:
+    """单次 eth_call，失败返回 None"""
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "eth_call",
+        "params": [{"to": to, "data": data}, "latest"],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(RPC_URL, json=payload)
+            res = r.json()
+            if "result" in res and res["result"] and res["result"] != "0x":
+                return res["result"]
+    except Exception:
+        pass
+    return None
+
+
+async def get_chain_state() -> Dict[str, Any]:
+    """读取 NAV / 金库总资产 / LOVE 总份额（1e6 精度换算）"""
+    nav_hex, assets_hex, supply_hex = (
+        await eth_call(VAULT, SELECTOR["nav"]),
+        await eth_call(VAULT, SELECTOR["totalAssets"]),
+        await eth_call(VAULT, SELECTOR["totalSupply"]),
+    )
+    if nav_hex and assets_hex and supply_hex:
+        return {
+            "nav": int(nav_hex, 16) / 10 ** NAV_DECIMALS,
+            "totalAssets": int(assets_hex, 16) / 10 ** ASSET_DECIMALS,
+            "totalSupply": int(supply_hex, 16) / 10 ** LOVE_DECIMALS,
+            "stale": False,
+        }
+    return dict(FALLBACK)
+
+
+async def get_love_balance(addr: str) -> float:
+    h = await eth_call(VAULT, SELECTOR["balanceOf"] + address_hex(addr))
+    return int(h, 16) / 10 ** LOVE_DECIMALS if h else 0.0
+
+
+async def get_usdc_balance(addr: str) -> float:
+    h = await eth_call(USDC, SELECTOR["balanceOf"] + address_hex(addr))
+    return int(h, 16) / 10 ** ASSET_DECIMALS if h else 0.0
+
+
+# ==================== 路由支付决策（与 a2a.mjs / 前端 smartRoute 三通道对齐） ====================
+
+def fee_of(amount: float) -> float:
+    return amount * FEE_RATE
+
+
+def decide_pay(amount: float, love_balance: float, wallet_usdc: float, nav: float) -> Dict[str, Any]:
+    needed = amount + fee_of(amount)
+    love_value = love_balance * nav
+    if wallet_usdc >= needed:
+        return {"kind": "PURE_PAY", "canPay": True, "needed": needed}
+    if love_value >= needed:
+        return {"kind": "PAY_WITH_LOVE", "canPay": True, "needed": needed}
+    return {
+        "kind": "INSUFFICIENT", "canPay": False, "needed": needed,
+        "shortfall": round(max(0.0, needed - wallet_usdc - love_value), 6),
+        "reason": "user_balance",
+    }
+
+
+def build_pay_steps(decision: Dict[str, Any], merchant: str, amount: float,
+                    ref: Optional[str], leader: Optional[str], nav: float) -> List[Dict[str, Any]]:
+    assets_wei = int(round(amount * 10 ** ASSET_DECIMALS))
+    needed_wei = int(round(decision["needed"] * 10 ** ASSET_DECIMALS))
+    ref_b32 = ref_to_bytes32_hex(ref)
+    leader_hex = address_hex(leader if leader and is_address(leader) else ZERO_ADDR)
+    pay_args = uint256_hex(assets_wei) + ref_b32 + address_hex(merchant) + leader_hex
+
+    if decision["kind"] == "PURE_PAY":
+        return [
+            {"step": 1, "name": "approve", "to": USDC, "chainId": CHAIN_ID,
+             "data": SELECTOR["approve"] + address_hex(ROUTER) + uint256_hex(needed_wei),
+             "value": "0x0",
+             "note": f"授权 Router 从你的 USDC 扣款 {decision['needed']:.6f}（金额 {amount} + 手续费 6bps）"},
+            {"step": 2, "name": "pay", "to": ROUTER, "chainId": CHAIN_ID,
+             "data": SELECTOR["pay"] + pay_args, "value": "0x0",
+             "note": f"原子分账：商户收 {amount * 0.999:.6f} USDC，1‰ 捐赠注入金库，引路人分账，NAV 抬升"},
+        ]
+    # PAY_WITH_LOVE
+    love_needed = round(decision["needed"] * 1.01 / nav, 6)  # 1% NAV 波动缓冲
+    love_wei = int(round(love_needed * 10 ** LOVE_DECIMALS))
+    return [
+        {"step": 1, "name": "approve", "to": VAULT, "chainId": CHAIN_ID,
+         "data": SELECTOR["approve"] + address_hex(ROUTER) + uint256_hex(love_wei),
+         "value": "0x0",
+         "note": f"授权 Router 使用你的 LOVE 份额（约 {love_needed} LOVE，含 1% 缓冲）"},
+        {"step": 2, "name": "payWithLove", "to": ROUTER, "chainId": CHAIN_ID,
+         "data": SELECTOR["payWithLove"] + pay_args, "value": "0x0",
+         "note": "赎回 LOVE 按 NAV 换 USDC 完成支付：商户收 USDC，捐赠注入金库，NAV 抬升"},
+    ]
+
+
+# ==================== MCP 工具定义 ====================
+
+TOOLS: List[Dict[str, Any]] = [
+    {
+        "name": "nav_query",
+        "description": "查询正和金库实时状态：NAV（净值）、金库 USDC 总资产、LOVE 总份额、累计溢价。"
+                       "只读，无需任何授权。传入 address 可同时查该地址的 LOVE/USDC 余额与浮盈。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string", "description": "（可选）要查余额的钱包地址 0x…"},
+            },
+        },
+    },
+    {
+        "name": "zhenghe_route",
+        "description": "构造一笔正和路由支付（消费入口）。返回签名就绪的 approve+pay calldata，"
+                       "调用方本地签名上链即完成原子正和支付：商户收 USDC + 捐赠注入金库 + 引路人分账 + NAV 抬升。"
+                       "路由决策：USDC 够→直接付；USDC 不足但 LOVE×NAV 够→赎回 LOVE 付；都不够→返回缺口。"
+                       "私钥永不经过服务器。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "merchant": {"type": "string", "description": "收款商户地址 0x…（必填）"},
+                "amount": {"type": "number", "description": "支付金额（USDC，必填）"},
+                "ref": {"type": "string", "description": "订单引用（可选，将 keccak 为 bytes32）"},
+                "leader": {"type": "string", "description": "引路人地址（可选，未绑定时可自引自收）"},
+                "payer": {"type": "string", "description": "付款方地址（可选，传入则按真实余额做路由决策）"},
+            },
+            "required": ["merchant", "amount"],
+        },
+    },
+    {
+        "name": "vault_action",
+        "description": "正和金库操作。action=deposit：USDC→LOVE（返回 approve+deposit calldata）；"
+                       "action=withdraw：LOVE→USDC（返回 redeem calldata）；action=balance：查 LOVE 余额+NAV+浮盈（只读）。"
+                       "金库无 owner、无管理函数，NAV 单调增长——存款安全由合约字节码保证，可自验。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["deposit", "withdraw", "balance"]},
+                "amount": {"type": "number", "description": "deposit=USDC 数量；withdraw=LOVE 数量"},
+                "address": {"type": "string", "description": "操作地址 0x…（deposit/withdraw 的接收方，balance 的查询方）"},
+            },
+            "required": ["action", "address"],
+        },
+    },
+    {
+        "name": "affiliate_bind",
+        "description": "绑定引路人（一次性、永久、链上不可改）。返回 bindReferrer calldata，签名上链即完成绑定。"
+                       "此后该地址每笔路由消费的 6bps USDC 立即分给引路人，商户捐赠 LOVE 的 20% 同样分账，原子结算。"
+                       "任何 Agent 都可以成为引路人推广正和并永久获取分成。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "leader": {"type": "string", "description": "引路人地址 0x…（必填）"},
+                "binder": {"type": "string", "description": "被绑定地址 0x…（calldata 的 from，仅用于展示）"},
+            },
+            "required": ["leader"],
+        },
+    },
+]
+
+
+# ==================== 工具执行 ====================
+
+async def tool_nav_query(args: Dict[str, Any]) -> Dict[str, Any]:
+    chain = await get_chain_state()
+    result: Dict[str, Any] = {
+        "nav": chain["nav"],
+        "totalAssetsUsdc": chain["totalAssets"],
+        "totalSupplyLove": chain["totalSupply"],
+        "premiumPct": round((chain["nav"] - 1) * 100, 4),
+        "chainId": CHAIN_ID,
+        "vault": VAULT,
+        "verified": not chain["stale"],
+        "note": "实时链上数据" if not chain["stale"] else "RPC 暂不可用，此为最近快照",
+        "verifyYourself": f"eth_call {VAULT} nav() selector 0xc1590cd7 on Base (chainId 8453)",
+    }
+    addr = args.get("address")
+    if addr and is_address(addr):
+        love = await get_love_balance(addr)
+        usdc = await get_usdc_balance(addr)
+        result["account"] = {
+            "address": addr,
+            "loveBalance": round(love, 6),
+            "usdcBalance": round(usdc, 6),
+            "loveValueUsdc": round(love * chain["nav"], 6),
+            "profitPct": round((chain["nav"] - 1) * 100, 4) if love > 0 else 0,
+        }
+    return result
+
+
+async def tool_zhenghe_route(args: Dict[str, Any]) -> Dict[str, Any]:
+    merchant = args.get("merchant", "")
+    if not is_address(merchant):
+        return {"error": "merchant 必须是合法的 0x 地址"}
+    try:
+        amount = float(args.get("amount", 0))
+    except (TypeError, ValueError):
+        return {"error": "amount 必须是数字"}
+    if amount <= 0:
+        return {"error": "amount 必须大于 0"}
+
+    chain = await get_chain_state()
+    payer = args.get("payer")
+    wallet_usdc, love_balance = 0.0, 0.0
+    balance_known = False
+    if payer and is_address(payer):
+        wallet_usdc = await get_usdc_balance(payer)
+        love_balance = await get_love_balance(payer)
+        balance_known = True
+    else:
+        # 未提供付款方：假设纯 USDC 支付通道，仅构造 calldata
+        wallet_usdc = amount + fee_of(amount)
+
+    decision = decide_pay(amount, love_balance, wallet_usdc, chain["nav"])
+    if not decision["canPay"]:
+        return {
+            "kind": "INSUFFICIENT", "canPay": False,
+            "needed": round(decision["needed"], 6),
+            "walletUsdc": round(wallet_usdc, 6),
+            "loveValueUsdc": round(love_balance * chain["nav"], 6),
+            "shortfall": decision["shortfall"],
+            "suggestion": "可先用 vault_action 存入 USDC 换 LOVE，或补足 USDC 后重试",
+        }
+
+    steps = build_pay_steps(decision, merchant, amount, args.get("ref"),
+                            args.get("leader"), chain["nav"])
+    inj = (amount * DONATION_FLOOR + fee_of(amount)) * 0.8
+    uplift = (inj / chain["totalAssets"] * 100) if chain["totalAssets"] > 0 else 0
+    result: Dict[str, Any] = {
+        "kind": decision["kind"],
+        "canPay": True,
+        "amount": amount,
+        "merchant": merchant,
+        "feeUsdc": round(fee_of(amount), 6),
+        "payerTotalDebit": round(decision["needed"], 6),
+        "merchantReceives": round(amount * 0.999, 6),
+        "donationToVault": round(amount * DONATION_FLOOR, 6),
+        "navUpliftPctEst": round(uplift, 8),
+        "nav": chain["nav"],
+        "steps": steps,
+        "signAndSend": "按 steps 顺序由付款方钱包签名发送（先 approve 后 pay），两步原子完成",
+        "balanceSource": "链上实查" if balance_known else "未提供 payer，按纯 USDC 通道构造",
+    }
+    leader = args.get("leader")
+    if leader and is_address(leader):
+        result["affiliate"] = {
+            "leader": leader,
+            "leaderFeeUsdc": round(amount * FEE_RATE, 6),
+            "leaderLoveSharePct": 20,
+            "binding": "permanent, on-chain, 原子结算",
+        }
+    else:
+        result["leaderHint"] = "未指定引路人：付款方可先用 affiliate_bind 自引自收，此后自己消费的 6bps+20%LOVE 分账归自己"
+    return result
+
+
+async def tool_vault_action(args: Dict[str, Any]) -> Dict[str, Any]:
+    action = args.get("action", "")
+    addr = args.get("address", "")
+    if not is_address(addr):
+        return {"error": "address 必须是合法的 0x 地址"}
+    chain = await get_chain_state()
+
+    if action == "balance":
+        love = await get_love_balance(addr)
+        usdc = await get_usdc_balance(addr)
+        return {
+            "address": addr,
+            "loveBalance": round(love, 6),
+            "usdcBalance": round(usdc, 6),
+            "nav": chain["nav"],
+            "loveValueUsdc": round(love * chain["nav"], 6),
+            "profitPct": round((chain["nav"] - 1) * 100, 4) if love > 0 else 0,
+            "verified": not chain["stale"],
+        }
+
+    try:
+        amount = float(args.get("amount", 0))
+    except (TypeError, ValueError):
+        return {"error": "amount 必须是数字"}
+    if amount <= 0:
+        return {"error": "amount 必须大于 0"}
+
+    if action == "deposit":
+        amount_wei = int(round(amount * 10 ** ASSET_DECIMALS))
+        love_est = round(amount / chain["nav"], 6)
+        return {
+            "action": "deposit",
+            "amountUsdc": amount,
+            "estLoveReceived": love_est,
+            "nav": chain["nav"],
+            "steps": [
+                {"step": 1, "name": "approve", "to": USDC, "chainId": CHAIN_ID,
+                 "data": SELECTOR["approve"] + address_hex(VAULT) + uint256_hex(amount_wei),
+                 "value": "0x0", "note": f"授权金库划扣 {amount} USDC"},
+                {"step": 2, "name": "deposit", "to": VAULT, "chainId": CHAIN_ID,
+                 "data": SELECTOR["deposit"] + uint256_hex(amount_wei) + address_hex(addr),
+                 "value": "0x0", "note": f"存入 {amount} USDC，按 NAV={chain['nav']} 铸造约 {love_est} LOVE"},
+            ],
+            "signAndSend": "按 steps 顺序签名发送，LOVE 立即到账，此后 NAV 增长即浮盈",
+            "safety": "LoveVault 无 owner、无管理函数，仅可注入与按净值赎回——basescan.org 可验源码",
+        }
+
+    if action == "withdraw":
+        love_wei = int(round(amount * 10 ** LOVE_DECIMALS))
+        usdc_est = round(amount * chain["nav"], 6)
+        return {
+            "action": "withdraw",
+            "amountLove": amount,
+            "estUsdcReceived": usdc_est,
+            "nav": chain["nav"],
+            "steps": [
+                {"step": 1, "name": "redeem", "to": VAULT, "chainId": CHAIN_ID,
+                 "data": SELECTOR["redeem"] + uint256_hex(love_wei) + address_hex(addr) + address_hex(addr),
+                 "value": "0x0", "note": f"赎回 {amount} LOVE，按 NAV={chain['nav']} 得约 {usdc_est} USDC"},
+            ],
+            "signAndSend": "签名发送即完成赎回，USDC 立即到账",
+        }
+
+    return {"error": "action 必须是 deposit / withdraw / balance 之一"}
+
+
+async def tool_affiliate_bind(args: Dict[str, Any]) -> Dict[str, Any]:
+    leader = args.get("leader", "")
+    if not is_address(leader):
+        return {"error": "leader 必须是合法的 0x 地址"}
+    return {
+        "action": "bindReferrer",
+        "leader": leader,
+        "steps": [
+            {"step": 1, "name": "bindReferrer", "to": ROUTER, "chainId": CHAIN_ID,
+             "data": SELECTOR["bindReferrer"] + address_hex(leader),
+             "value": "0x0", "note": f"永久绑定引路人 {leader}（一次性、链上不可改）"},
+        ],
+        "signAndSend": "由被绑定地址的钱包签名发送即生效",
+        "feeTable": {
+            "consumerFeeBps": 30,
+            "leaderFeeShare": "手续费的 20%（=6bps USDC，每笔立即到账）",
+            "merchantDonationFloorBps": 10,
+            "leaderDonationShare": "商户捐赠 LOVE 的 20%",
+            "settlement": "atomic on-chain，随每笔路由支付实时结算",
+        },
+        "note": "绑定后不可更改。任何 Agent 都可成为引路人：让他人绑定你的地址，其每笔消费你都有分成。",
+    }
+
+
+TOOL_HANDLERS = {
+    "nav_query": tool_nav_query,
+    "zhenghe_route": tool_zhenghe_route,
+    "vault_action": tool_vault_action,
+    "affiliate_bind": tool_affiliate_bind,
+}
+
+# ==================== FastAPI App ====================
 
 app = FastAPI(
-    title="正和系统 API",
-    description="AI Agent经济价值交换协议 - REST API + MCP Server",
-    version="1.1.0",
+    title="正和系统 MCP Server",
+    description="Base 主网去中心化支付路由 + 资本保全金库。三大链上可核验特性："
+                "①存款安全（无 owner、NAV 单调）②引路人激励（6bps+20% LOVE 永久分账）③消费即升值（每笔注入抬升 NAV）。"
+                "无数据库、无 API Key、无私钥——读走 eth_call，写返回签名就绪 calldata。",
+    version="2.0.0",
 )
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 
-# ===== 健康检查 =====
+def jsonrpc_result(req_id: Any, result: Any) -> Dict[str, Any]:
+    return {"jsonrpc": "2.0", "result": result, "id": req_id}
+
+
+def jsonrpc_error(req_id: Any, code: int, message: str) -> Dict[str, Any]:
+    return {"jsonrpc": "2.0", "error": {"code": code, "message": message}, "id": req_id}
+
 
 @app.get("/")
 async def root():
-    return {"name": "正和系统 API", "version": "1.1.0", "status": "running"}
+    return {
+        "name": "zhenghe-mcp",
+        "version": "2.0.0",
+        "protocol": "MCP (JSON-RPC 2.0 over HTTP)",
+        "endpoint": "POST /mcp",
+        "chain": {"chainId": CHAIN_ID, "router": ROUTER, "vault": VAULT, "usdc": USDC},
+        "tools": [t["name"] for t in TOOLS],
+        "sellingPoints": [
+            "存款安全：金库无 owner、无管理函数，NAV 单调增长，字节码可验",
+            "引路人激励：一次绑定永久分账，6bps USDC 立即到账 + 捐赠 LOVE 的 20%",
+            "消费即升值：每笔路由支付注入手续费与捐赠，抬升全体持有者 NAV",
+        ],
+    }
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
-
-
-# ===== REST API 端点 =====
-
-@app.get("/v1/stats")
-async def get_stats():
-    """获取系统统计"""
-    db = await get_db_engine()
-    if not db:
-        return {
-            "total_accounts": 0,
-            "total_transactions": 0,
-            "total_agents": 0,
-            "total_users": 0,
-            "pool_usdt": 0,
-            "pool_tokens": 0,
-            "current_price": 1.0,
-            "cumulative_burned": 0
-        }
-    
-    try:
-        async with db.connect() as conn:
-            result = await conn.execute(text("SELECT COUNT(*) FROM accounts"))
-            total_accounts = result.scalar() or 0
-            
-            result = await conn.execute(text("SELECT COUNT(*) FROM transactions"))
-            total_txs = result.scalar() or 0
-            
-            result = await conn.execute(text("SELECT COUNT(*) FROM agents"))
-            total_agents = result.scalar() or 0
-            
-            result = await conn.execute(text("SELECT COUNT(*) FROM users"))
-            total_users = result.scalar() or 0
-            
-            # 获取资金池数据
-            result = await conn.execute(
-                text("SELECT price, total_supply, capital_pool FROM prices ORDER BY recorded_at DESC LIMIT 1")
-            )
-            pool_row = result.fetchone()
-            pool_usdt = float(pool_row[2]) if pool_row else 0
-            pool_tokens = float(pool_row[1]) if pool_row else 0
-            current_price = float(pool_row[0]) if pool_row else 1.0
-            
-            # 累计销毁
-            result = await conn.execute(
-                text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE tx_type = 'BURN'")
-            )
-            cumulative_burned = float(result.scalar() or 0)
-            
-            # 累计铸造
-            result = await conn.execute(
-                text("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE tx_type = 'MINT'")
-            )
-            cumulative_minted = float(result.scalar() or 0)
-            
-            return {
-                "total_accounts": total_accounts,
-                "total_transactions": total_txs,
-                "total_agents": total_agents,
-                "total_users": total_users,
-                "pool_usdt": pool_usdt,
-                "pool_tokens": pool_tokens,
-                "current_price": current_price,
-                "cumulative_burned": cumulative_burned,
-                "cumulative_minted": cumulative_minted
-            }
-    except Exception as e:
-        return {
-            "total_accounts": 0,
-            "total_transactions": 0,
-            "total_agents": 0,
-            "total_users": 0,
-            "pool_usdt": 0,
-            "pool_tokens": 0,
-            "current_price": 1.0,
-            "cumulative_burned": 0,
-            "cumulative_minted": 0,
-            "error": str(e)
-        }
-
-
-@app.get("/v1/pool/state")
-async def get_pool_state():
-    """获取资金池状态"""
-    db = await get_db_engine()
-    if not db:
-        return {"price": "1.0", "total_supply": "0", "capital_pool": "0"}
-    
-    try:
-        async with db.connect() as conn:
-            result = await conn.execute(
-                text("SELECT price, total_supply, capital_pool FROM prices ORDER BY recorded_at DESC LIMIT 1")
-            )
-            row = result.fetchone()
-            
-            if row:
-                return {
-                    "price": str(row[0]),
-                    "total_supply": str(row[1]),
-                    "capital_pool": str(row[2])
-                }
-    except:
-        pass
-    
-    return {"price": "1.0", "total_supply": "0", "capital_pool": "0"}
-
-
-@app.get("/v1/agents")
-async def get_agents():
-    """获取Agent列表"""
-    db = await get_db_engine()
-    if not db:
-        return {"agents": []}
-    
-    try:
-        async with db.connect() as conn:
-            result = await conn.execute(
-                text("""
-                    SELECT a.id, a.name, a.status, a.created_at, a.account_id, 
-                           COALESCE(a.pricing_usdt, 1.0) as pricing_usdt,
-                           COALESCE(a.category, 'AI服务') as category,
-                           COALESCE(a.description, '提供优质AI服务') as description
-                    FROM agents a 
-                    ORDER BY a.created_at DESC LIMIT 20
-                """)
-            )
-            rows = result.fetchall()
-            
-            return {
-                "agents": [
-                    {
-                        "id": row[0],
-                        "agent_id": row[0],
-                        "name": row[1],
-                        "status": row[2],
-                        "created_at": str(row[3]) if row[3] else "",
-                        "account_id": row[4] if row[4] else f"acc_{row[0]}",
-                        "pricing_usdt": str(row[5]) if row[5] else "1.0",
-                        "category": row[6] if row[6] else "AI服务",
-                        "description": row[7] if row[7] else "提供优质AI服务"
-                    }
-                    for row in rows
-                ]
-            }
-    except:
-        return {"agents": []}
-
-
-@app.post("/v1/agents/register")
-async def register_agent_api(request: Request):
-    """注册新Agent（REST API）"""
-    body = await request.json()
-    agent_name = body.get("name", f"Agent_{uuid.uuid4().hex[:8]}")
-    category = body.get("category", "AI服务")
-    description = body.get("description", "提供优质AI服务")
-    pricing_usdt = body.get("pricing_usdt", "1.0")
-    
-    db = await get_db_engine()
-    if not db:
-        return {"success": False, "error": "数据库未配置"}
-    
-    try:
-        agent_id = f"agent_{uuid.uuid4().hex[:24]}"
-        account_id = f"acc_{uuid.uuid4().hex[:24]}"
-        api_key = f"sk_live_{secrets.token_hex(24)}"
-        
-        async with db.begin() as conn:
-            # 创建Agent关联账户
-            await conn.execute(
-                text("INSERT INTO accounts (id, balance, account_type) VALUES (:id, 0, 'agent')"),
-                {"id": account_id}
-            )
-            
-            # 注册Agent
-            await conn.execute(
-                text("INSERT INTO agents (id, name, status, owner_user_id, account_id, pricing_usdt, category, description) VALUES (:id, :name, 'active', 'system', :account_id, :pricing, :category, :description)"),
-                {"id": agent_id, "name": agent_name, "account_id": account_id, "pricing": pricing_usdt, "category": category, "description": description}
-            )
-            
-            # 创建API Key
-            await conn.execute(
-                text("INSERT INTO api_keys (id, key_hash, agent_id, permissions) VALUES (:id, :key, :agent, '{\"role\": \"agent\"}'::jsonb)"),
-                {"id": f"key_{uuid.uuid4().hex[:24]}", "key": api_key, "agent": agent_id}
-            )
-        
-        return {
-            "success": True,
-            "agent_id": agent_id,
-            "name": agent_name,
-            "account_id": account_id,
-            "api_key": api_key,
-            "category": category,
-            "description": description,
-            "pricing_usdt": pricing_usdt
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@app.get("/v1/transactions")
-async def get_transactions(limit: int = 50):
-    """获取交易列表"""
-    db = await get_db_engine()
-    if not db:
-        return {"transactions": []}
-    
-    try:
-        async with db.connect() as conn:
-            result = await conn.execute(
-                text("SELECT id, tx_type, amount, created_at FROM transactions ORDER BY created_at DESC LIMIT :limit"),
-                {"limit": limit}
-            )
-            rows = result.fetchall()
-            
-            return {
-                "transactions": [
-                    {"id": row[0], "type": row[1], "amount": str(row[2]), "created_at": str(row[3]) if row[3] else ""}
-                    for row in rows
-                ]
-            }
-    except:
-        return {"transactions": []}
-
-
-@app.get("/v1/accounts")
-async def get_accounts():
-    """获取账户列表"""
-    db = await get_db_engine()
-    if not db:
-        return {"accounts": []}
-    
-    try:
-        async with db.connect() as conn:
-            result = await conn.execute(
-                text("""
-                    SELECT a.id, a.balance, a.user_id, u.username 
-                    FROM accounts a 
-                    LEFT JOIN users u ON a.user_id = u.id
-                    ORDER BY a.created_at DESC LIMIT 20
-                """)
-            )
-            rows = result.fetchall()
-            
-            return {
-                "accounts": [
-                    {
-                        "account_id": row[0],
-                        "balance": str(row[1]),
-                        "user_id": row[2],
-                        "username": row[3] or "未命名用户"
-                    }
-                    for row in rows
-                ]
-            }
-    except:
-        return {"accounts": []}
-
-
-@app.get("/v1/accounts/{account_id}")
-async def get_account(account_id: str):
-    """获取账户信息"""
-    db = await get_db_engine()
-    if not db:
-        return {"error": "数据库未配置"}
-    
-    try:
-        async with db.connect() as conn:
-            result = await conn.execute(
-                text("""
-                    SELECT a.id, a.balance, a.user_id, u.username
-                    FROM accounts a
-                    LEFT JOIN users u ON a.user_id = u.id
-                    WHERE a.id = :id
-                """),
-                {"id": account_id}
-            )
-            row = result.fetchone()
-            
-            if row:
-                return {
-                    "account_id": row[0],
-                    "id": row[0],
-                    "balance": str(row[1]),
-                    "user_id": row[2],
-                    "username": row[3] or "未命名用户"
-                }
-    except:
-        pass
-    
-    return {"error": "账户不存在"}
-
-
-@app.post("/v1/demo/init")
-async def demo_init():
-    """初始化演示数据"""
-    db = await get_db_engine()
-    if not db:
-        return {"success": False, "error": "数据库未配置"}
-    
-    try:
-        async with db.begin() as conn:
-            # 数据库迁移：添加account_id列到agents表
-            try:
-                await conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS account_id VARCHAR(100)"))
-            except:
-                pass  # 列已存在则忽略
-            
-            # 数据库迁移：添加created_at列到agents表
-            try:
-                await conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"))
-            except:
-                pass
-            
-            # 数据库迁移：添加pricing_usdt, category, description列到agents表
-            try:
-                await conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS pricing_usdt DECIMAL(20,8) DEFAULT 1.0"))
-                await conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS category VARCHAR(100) DEFAULT 'AI服务'"))
-                await conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '提供优质AI服务'"))
-            except:
-                pass
-            
-            demo_users = []
-            for i in range(2):
-                user_id = f"user_demo_{i+1}"
-                username = f"演示用户{i+1}"
-                account_id = f"acc_demo_{i+1}"
-                balance = 100 if i == 0 else 50
-                
-                await conn.execute(
-                    text("INSERT INTO users (id, username, user_type) VALUES (:id, :name, 'demo') ON CONFLICT (id) DO NOTHING"),
-                    {"id": user_id, "name": username}
-                )
-                
-                await conn.execute(
-                    text("INSERT INTO accounts (id, user_id, balance, account_type) VALUES (:id, :user_id, :balance, 'primary') ON CONFLICT (id) DO NOTHING"),
-                    {"id": account_id, "user_id": user_id, "balance": balance}
-                )
-                
-                demo_users.append({"user_id": user_id, "account_id": account_id, "balance": balance})
-            
-            demo_agents = []
-            for i in range(5):
-                agent_id = f"agent_demo_{i+1}"
-                agent_name = f"演示Agent{i+1}"
-                
-                await conn.execute(
-                    text("INSERT INTO agents (id, name, owner_user_id, status) VALUES (:id, :name, 'system', 'active') ON CONFLICT (id) DO NOTHING"),
-                    {"id": agent_id, "name": agent_name}
-                )
-                
-                demo_agents.append({"agent_id": agent_id, "name": agent_name})
-            
-            await conn.execute(
-                text("INSERT INTO prices (price, total_supply, capital_pool, recorded_at) VALUES (1.0, 150, 150, :now) ON CONFLICT DO NOTHING"),
-                {"now": datetime.utcnow()}
-            )
-        
-        return {
-            "success": True,
-            "message": "演示数据初始化成功",
-            "alice": {
-                "user_id": demo_users[0]["user_id"],
-                "account_id": demo_users[0]["account_id"],
-                "username": "演示用户1",
-                "balance": demo_users[0]["balance"]
-            },
-            "demo_users": demo_users,
-            "demo_agents": demo_agents
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@app.post("/v1/users")
-async def create_user(request: Request):
-    """创建用户"""
-    body = await request.json()
-    username = body.get("username", "新用户")
-    
-    db = await get_db_engine()
-    if not db:
-        return {"error": "数据库未配置"}
-    
-    try:
-        user_id = f"user_{uuid.uuid4().hex[:24]}"
-        account_id = f"acc_{uuid.uuid4().hex[:24]}"
-        
-        async with db.begin() as conn:
-            await conn.execute(
-                text("INSERT INTO users (id, username, user_type) VALUES (:id, :name, 'user')"),
-                {"id": user_id, "name": username}
-            )
-            
-            await conn.execute(
-                text("INSERT INTO accounts (id, user_id, balance, account_type) VALUES (:id, :user_id, 0, 'primary')"),
-                {"id": account_id, "user_id": user_id}
-            )
-        
-        return {
-            "user_id": user_id,
-            "account_id": account_id,
-            "username": username,
-            "user": {
-                "user_id": user_id,
-                "username": username
-            },
-            "account": {
-                "account_id": account_id,
-                "balance": "0"
-            }
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.post("/v1/mint")
-async def mint_tokens(request: Request):
-    """铸造积分（充值USDT→积分）"""
-    body = await request.json()
-    account_id = body.get("account_id")
-    usdt_amount = Decimal(str(body.get("usdt_amount") or body.get("amount", 0)))
-    
-    db = await get_db_engine()
-    if not db:
-        return {"success": False, "error": "数据库未配置"}
-    
-    try:
-        async with db.begin() as conn:
-            # 获取当前价格
-            result = await conn.execute(
-                text("SELECT price, total_supply, capital_pool FROM prices ORDER BY recorded_at DESC LIMIT 1 FOR UPDATE")
-            )
-            price_row = result.fetchone()
-            current_price = Decimal(str(price_row[0])) if price_row else Decimal("1.0")
-            total_supply = Decimal(str(price_row[1])) if price_row else Decimal("0")
-            capital_pool = Decimal(str(price_row[2])) if price_row else Decimal("0")
-            
-            # 99.1%入资金池（0.9%手续费归池）
-            pool_in = usdt_amount * Decimal("0.991")
-            # 铸造的积分数量 = 入池USDT / 当前价格
-            minted_tokens = pool_in / current_price
-            
-            # 更新账户余额
-            result = await conn.execute(
-                text("UPDATE accounts SET balance = balance + :tokens WHERE id = :id RETURNING balance"),
-                {"tokens": minted_tokens, "id": account_id}
-            )
-            row = result.fetchone()
-            
-            if not row:
-                return {"success": False, "error": "账户不存在"}
-            
-            # 更新资金池
-            new_supply = total_supply + minted_tokens
-            new_capital = capital_pool + pool_in
-            new_price = new_capital / new_supply if new_supply > 0 else current_price
-            
-            await conn.execute(
-                text("INSERT INTO prices (price, total_supply, capital_pool, recorded_at) VALUES (:price, :supply, :capital, :now)"),
-                {"price": new_price, "supply": new_supply, "capital": new_capital, "now": datetime.utcnow()}
-            )
-            
-            # 记录交易
-            tx_id = f"tx_{uuid.uuid4().hex[:24]}"
-            await conn.execute(
-                text("INSERT INTO transactions (id, tx_type, amount, from_account_id) VALUES (:id, 'MINT', :amount, :from)"),
-                {"id": tx_id, "amount": minted_tokens, "from": account_id}
-            )
-            
-            return {
-                "success": True,
-                "new_balance": str(row[0]),
-                "minted_tokens": str(minted_tokens),
-                "minted": str(minted_tokens),
-                "pool_in": str(pool_in),
-                "new_price": str(new_price)
-            }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@app.post("/v1/burn")
-async def burn_tokens(request: Request):
-    """燃烧积分（提现积分→USDT）"""
-    body = await request.json()
-    account_id = body.get("account_id")
-    token_amount = Decimal(str(body.get("token_amount") or body.get("amount", 0)))
-    
-    db = await get_db_engine()
-    if not db:
-        return {"success": False, "error": "数据库未配置"}
-    
-    try:
-        async with db.begin() as conn:
-            # 获取当前价格和资金池
-            result = await conn.execute(
-                text("SELECT price, total_supply, capital_pool FROM prices ORDER BY recorded_at DESC LIMIT 1 FOR UPDATE")
-            )
-            price_row = result.fetchone()
-            current_price = Decimal(str(price_row[0])) if price_row else Decimal("1.0")
-            total_supply = Decimal(str(price_row[1])) if price_row else Decimal("0")
-            capital_pool = Decimal(str(price_row[2])) if price_row else Decimal("0")
-            
-            # 检查账户余额
-            result = await conn.execute(
-                text("SELECT balance FROM accounts WHERE id = :id FOR UPDATE"),
-                {"id": account_id}
-            )
-            acc_row = result.fetchone()
-            
-            if not acc_row or Decimal(str(acc_row[0])) < token_amount:
-                return {"success": False, "error": "余额不足"}
-            
-            # 计算可提现USDT = 积分 × 当前价格（0%手续费）
-            usdt_out = token_amount * current_price
-            
-            # 更新账户余额
-            result = await conn.execute(
-                text("UPDATE accounts SET balance = balance - :tokens WHERE id = :id RETURNING balance"),
-                {"tokens": token_amount, "id": account_id}
-            )
-            new_row = result.fetchone()
-            
-            # 更新资金池
-            new_supply = total_supply - token_amount
-            new_capital = capital_pool - usdt_out
-            new_price = new_capital / new_supply if new_supply > 0 else current_price
-            
-            await conn.execute(
-                text("INSERT INTO prices (price, total_supply, capital_pool, recorded_at) VALUES (:price, :supply, :capital, :now)"),
-                {"price": new_price, "supply": new_supply, "capital": new_capital, "now": datetime.utcnow()}
-            )
-            
-            # 记录交易
-            tx_id = f"tx_{uuid.uuid4().hex[:24]}"
-            await conn.execute(
-                text("INSERT INTO transactions (id, tx_type, amount, from_account_id) VALUES (:id, 'BURN', :amount, :from)"),
-                {"id": tx_id, "amount": token_amount, "from": account_id}
-            )
-            
-            return {
-                "success": True,
-                "new_balance": str(new_row[0]),
-                "burned": str(token_amount),
-                "usdt_out": str(usdt_out)
-            }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@app.post("/v1/consume")
-async def consume_service(request: Request):
-    """消费服务 - 正和经济模型完整实现"""
-    body = await request.json()
-    consumer_account_id = body.get("consumer_account_id")
-    provider_agent_id = body.get("agent_id") or body.get("provider_agent_id")
-    pricing_usdt = Decimal(str(body.get("pricing_usdt", 0)))
-    
-    db = await get_db_engine()
-    if not db:
-        return {"success": False, "error": "数据库未配置"}
-    
-    try:
-        async with db.begin() as conn:
-            # 获取当前价格和资金池
-            result = await conn.execute(
-                text("SELECT price, total_supply, capital_pool FROM prices ORDER BY recorded_at DESC LIMIT 1 FOR UPDATE")
-            )
-            price_row = result.fetchone()
-            price = Decimal(str(price_row[0])) if price_row else Decimal("1.0")
-            total_supply = Decimal(str(price_row[1])) if price_row else Decimal("0")
-            capital_pool = Decimal(str(price_row[2])) if price_row else Decimal("0")
-            
-            # 消费者销毁积分 = 定价USDT / 价格 × 1.009
-            burn_multiplier = Decimal("1.009")
-            burned_tokens = (pricing_usdt / price) * burn_multiplier
-            
-            # 消费者奖励 = 定价 × 0.5%
-            consumer_reward_usdt = pricing_usdt * Decimal("0.005")
-            consumer_reward_tokens = consumer_reward_usdt / price
-            
-            # 检查消费者余额
-            result = await conn.execute(
-                text("SELECT balance FROM accounts WHERE id = :id FOR UPDATE"),
-                {"id": consumer_account_id}
-            )
-            row = result.fetchone()
-            
-            if not row or Decimal(str(row[0])) < burned_tokens:
-                return {"success": False, "error": "余额不足"}
-            
-            # 更新消费者余额（销毁积分 + 获得奖励）
-            consumer_new_balance = Decimal(str(row[0])) - burned_tokens + consumer_reward_tokens
-            await conn.execute(
-                text("UPDATE accounts SET balance = :balance WHERE id = :id"),
-                {"balance": consumer_new_balance, "id": consumer_account_id}
-            )
-            
-            # 查找服务者账户（Agent关联的账户）
-            result = await conn.execute(
-                text("SELECT account_id FROM agents WHERE id = :agent_id"),
-                {"agent_id": provider_agent_id}
-            )
-            agent_row = result.fetchone()
-            
-            if agent_row and agent_row[0]:
-                provider_account_id = agent_row[0]
-                # 服务者获得全额USDT对应的积分
-                provider_tokens = pricing_usdt / price
-                await conn.execute(
-                    text("UPDATE accounts SET balance = balance + :tokens WHERE id = :id"),
-                    {"tokens": provider_tokens, "id": provider_account_id}
-                )
-            
-            # 更新资金池（扣除给服务者和奖励）
-            pool_out = pricing_usdt + consumer_reward_usdt
-            new_capital = capital_pool - pool_out
-            new_supply = total_supply - burned_tokens + consumer_reward_tokens
-            if agent_row and agent_row[0]:
-                new_supply += provider_tokens
-            
-            new_price = new_capital / new_supply if new_supply > 0 else price
-            
-            await conn.execute(
-                text("INSERT INTO prices (price, total_supply, capital_pool, recorded_at) VALUES (:price, :supply, :capital, :now)"),
-                {"price": new_price, "supply": new_supply, "capital": new_capital, "now": datetime.utcnow()}
-            )
-            
-            # 记录交易
-            tx_id = f"tx_{uuid.uuid4().hex[:24]}"
-            service_id = f"svc_{uuid.uuid4().hex[:24]}"
-            await conn.execute(
-                text("INSERT INTO transactions (id, tx_type, amount, from_account_id) VALUES (:id, 'CONSUME', :amount, :from)"),
-                {"id": tx_id, "amount": burned_tokens, "from": consumer_account_id}
-            )
-            
-            return {
-                "success": True,
-                "tx_id": tx_id,
-                "service_id": service_id,
-                "burned_tokens": str(burned_tokens),
-                "consumer_reward": str(consumer_reward_tokens),
-                "provider_payment": str(pricing_usdt / price) if agent_row and agent_row[0] else "0",
-                "new_balance": str(consumer_new_balance),
-                "new_price": str(new_price)
-            }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-async def register_agent_internal(arguments: dict):
-    """Agent注册内部函数"""
-    agent_name = arguments.get("name", f"Agent_{uuid.uuid4().hex[:8]}")
-    
-    db = await get_db_engine()
-    if not db:
-        return {"success": False, "error": "数据库未配置"}
-    
-    try:
-        agent_id = f"agent_{uuid.uuid4().hex[:24]}"
-        account_id = f"acc_{uuid.uuid4().hex[:24]}"
-        api_key = f"sk_live_{secrets.token_hex(24)}"
-        
-        async with db.begin() as conn:
-            # 创建Agent关联账户
-            await conn.execute(
-                text("INSERT INTO accounts (id, balance, account_type) VALUES (:id, 0, 'agent')"),
-                {"id": account_id}
-            )
-            
-            # 注册Agent
-            await conn.execute(
-                text("INSERT INTO agents (id, name, status, account_id) VALUES (:id, :name, 'active', :account_id)"),
-                {"id": agent_id, "name": agent_name, "account_id": account_id}
-            )
-            
-            # 创建API Key
-            await conn.execute(
-                text("INSERT INTO api_keys (id, key_hash, agent_id, permissions) VALUES (:id, :key, :agent, '{\"role\": \"agent\"}'::jsonb)"),
-                {"id": f"key_{uuid.uuid4().hex[:24]}", "key": api_key, "agent": agent_id}
-            )
-        
-        return {
-            "success": True,
-            "agent_id": agent_id,
-            "agent_name": agent_name,
-            "account_id": account_id,
-            "api_key": api_key
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    chain = await get_chain_state()
+    return {"ok": True, "nav": chain["nav"], "stale": chain["stale"], "ts": int(time.time())}
 
 
 @app.post("/mcp")
 async def mcp_endpoint(request: Request):
-    """MCP JSON-RPC 2.0 端点"""
     try:
         body = await request.json()
-        method = body.get("method", "")
-        params = body.get("params", {})
-        request_id = body.get("id", 1)
-        
-        if method == "tools/list":
-            tools = [
-                {"name": "get_balance", "description": "查询账户积分余额", "inputSchema": {"type": "object", "properties": {"account_id": {"type": "string", "description": "账户ID"}}}},
-                {"name": "get_price", "description": "查询当前积分价格和资金池状态"},
-                {"name": "get_stats", "description": "查询系统统计数据"},
-                {"name": "get_agents", "description": "获取Agent列表"},
-                {"name": "create_account", "description": "创建新账户", "inputSchema": {"type": "object", "properties": {"username": {"type": "string", "description": "用户名"}}}},
-                {"name": "register_agent", "description": "注册新Agent", "inputSchema": {"type": "object", "properties": {"name": {"type": "string", "description": "Agent名称"}}}},
-                {"name": "mint", "description": "铸造积分（充值）", "inputSchema": {"type": "object", "properties": {"account_id": {"type": "string"}, "amount": {"type": "number", "description": "USDT金额"}}}},
-                {"name": "burn", "description": "燃烧积分（提现）", "inputSchema": {"type": "object", "properties": {"account_id": {"type": "string"}, "amount": {"type": "number", "description": "积分数量"}}}},
-                {"name": "consume", "description": "消费Agent服务", "inputSchema": {"type": "object", "properties": {"consumer_account_id": {"type": "string"}, "agent_id": {"type": "string"}, "pricing_usdt": {"type": "number"}}}},
-            ]
-            return {
-                "jsonrpc": "2.0",
-                "result": {"tools": tools},
-                "id": request_id
-            }
-        
-        elif method == "tools/call":
-            tool_name = params.get("name", "")
-            arguments = params.get("arguments", {})
-            
-            if tool_name == "get_price":
-                result = await get_pool_state()
-            elif tool_name == "get_balance":
-                result = await get_account(arguments.get("account_id", ""))
-            elif tool_name == "get_stats":
-                result = await get_stats()
-            elif tool_name == "get_agents":
-                result = await get_agents()
-            elif tool_name == "mint":
-                # 构造模拟Request对象
-                class MockRequest:
-                    async def json(self):
-                        return arguments
-                result = await mint_tokens(MockRequest())
-            elif tool_name == "burn":
-                class MockRequest:
-                    async def json(self):
-                        return arguments
-                result = await burn_tokens(MockRequest())
-            elif tool_name == "consume":
-                class MockRequest:
-                    async def json(self):
-                        return arguments
-                result = await consume_service(MockRequest())
-            elif tool_name == "register_agent":
-                result = await register_agent_internal(arguments)
-            elif tool_name == "create_account":
-                class MockRequest:
-                    async def json(self):
-                        return arguments
-                result = await create_user(MockRequest())
-            else:
-                result = {"error": f"工具不存在: {tool_name}"}
-            
-            return {
-                "jsonrpc": "2.0",
-                "result": {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]},
-                "id": request_id
-            }
-        
-        else:
-            return {
-                "jsonrpc": "2.0",
-                "error": {"code": -32601, "message": f"方法不存在: {method}"},
-                "id": request_id
-            }
-    
-    except Exception as e:
-        return {
-            "jsonrpc": "2.0",
-            "error": {"code": -32603, "message": str(e)},
-            "id": 1
-        }
+    except Exception:
+        return JSONResponse(jsonrpc_error(None, -32700, "Parse error: invalid JSON"))
+
+    if body.get("jsonrpc") != "2.0":
+        return JSONResponse(jsonrpc_error(body.get("id"), -32600, "jsonrpc must be '2.0'"))
+
+    method = body.get("method", "")
+    params = body.get("params") or {}
+    req_id = body.get("id")
+
+    if method == "initialize":
+        return JSONResponse(jsonrpc_result(req_id, {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "zhenghe-mcp", "version": "2.0.0"},
+        }))
+
+    if method in ("notifications/initialized", "initialized"):
+        return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {}})
+
+    if method == "ping":
+        return JSONResponse(jsonrpc_result(req_id, {}))
+
+    if method == "tools/list":
+        return JSONResponse(jsonrpc_result(req_id, {"tools": TOOLS}))
+
+    if method == "tools/call":
+        name = params.get("name", "")
+        arguments = params.get("arguments") or {}
+        handler = TOOL_HANDLERS.get(name)
+        if not handler:
+            return JSONResponse(jsonrpc_error(req_id, -32602, f"未知工具: {name}"))
+        try:
+            result = await handler(arguments)
+            import json as _json
+            return JSONResponse(jsonrpc_result(req_id, {
+                "content": [{"type": "text", "text": _json.dumps(result, ensure_ascii=False, indent=2)}],
+                "isError": "error" in result,
+            }))
+        except Exception as e:
+            return JSONResponse(jsonrpc_result(req_id, {
+                "content": [{"type": "text", "text": f'{{"error": "工具执行异常: {e}"}}'}],
+                "isError": True,
+            }))
+
+    return JSONResponse(jsonrpc_error(req_id, -32601, f"Method not found: {method}"))
 
 
-# Vercel入口
+# Vercel 入口
 handler = app
