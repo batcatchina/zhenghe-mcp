@@ -1,0 +1,13 @@
+{
+  "name": "zhenghe-mcp",
+  "displayName": "Zhenghe — 正和支付路由与资本保全金库",
+  "description": "Base 主网去中心化支付路由+金库 MCP：nav_query / zhenghe_route / vault_action / affiliate_bind。存款安全（无 owner、NAV 单调）·引路人激励（6bps+20% LOVE 永久分账）·消费即升值（每笔注入抬升 NAV），全部链上可核验。",
+  "categories": ["finance", "crypto", "payments"],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.zheng-he.top/mcp"
+    }
+  ],
+  "maintainers": ["batcatchina"]
+}

@@ -517,10 +517,12 @@ async def mcp_endpoint(request: Request):
     req_id = body.get("id")
 
     if method == "initialize":
+        # 回显客户端请求的协议版本（兼容各版本 Registry/目录的健康扫描）
+        client_ver = params.get("protocolVersion") or "2024-11-05"
         return JSONResponse(jsonrpc_result(req_id, {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": client_ver,
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "zhenghe-mcp", "version": "2.0.0"},
+            "serverInfo": {"name": "zhenghe-mcp", "version": "2.0.1"},
         }))
 
     if method in ("notifications/initialized", "initialized"):

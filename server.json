@@ -1,0 +1,17 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "top.zheng-he/zhenghe-mcp",
+  "title": "Zhenghe — 正和支付路由与资本保全金库",
+  "description": "Base 主网去中心化支付路由+金库：查 NAV、构造路由支付 calldata、金库存取、绑定引路人分账。存款安全·引路人激励·消费即升值，全部链上可核验。",
+  "version": "2.0.1",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.zheng-he.top/mcp"
+    }
+  ],
+  "repository": {
+    "url": "https://github.com/batcatchina/zhenghe-mcp",
+    "source": "github"
+  }
+}

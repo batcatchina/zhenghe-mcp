@@ -1,5 +1,7 @@
 # 正和 MCP Server（zhenghe-mcp）
 
+mcp-name: top.zheng-he/zhenghe-mcp
+
 > Base 主网去中心化支付路由 + 资本保全金库的 MCP 接口。
 > 让任何 AI Agent 通过四个工具接入正和系统——查 NAV、路由支付、金库存取、绑定引路人。
 
